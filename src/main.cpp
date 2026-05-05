@@ -15,6 +15,8 @@
 #endif
 
 #ifdef GEODE_IS_ANDROID
+#undef __ANDROID_MIN_SDK_VERSION__
+#define __ANDROID_MIN_SDK_VERSION__ 26
 #include <aaudio/AAudio.h>
 #include <android/log.h>
 #define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "VoiceControl", __VA_ARGS__)
@@ -367,7 +369,6 @@ static void mic_thread_func() {
     AAudioStreamBuilder_setSampleRate(builder, 44100);
     AAudioStreamBuilder_setChannelCount(builder, 1);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setInputPreset(builder, AAUDIO_INPUT_PRESET_GENERIC);
     AAudioStreamBuilder_setDataCallback(builder, audioCallback, nullptr);
 
     aaudio_result_t result = AAudioStreamBuilder_openStream(builder, &g_aaudioStream);
