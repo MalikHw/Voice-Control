@@ -15,26 +15,9 @@
 #endif
 
 #ifdef GEODE_IS_ANDROID
-#include <jni.h>
+#include <aaudio/AAudio.h>
 #include <android/log.h>
-#include <dlfcn.h>
 #define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "VoiceControl", __VA_ARGS__)
-
-static JavaVM* getJavaVM() {
-    using GetCreatedJavaVMs_t = jint(*)(JavaVM**, jsize, jsize*);
-
-    void* libart = dlopen("libart.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!libart) libart = dlopen("libdvm.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!libart) return nullptr;
-
-    auto fn = (GetCreatedJavaVMs_t)dlsym(libart, "JNI_GetCreatedJavaVMs");
-    if (!fn) return nullptr;
-
-    JavaVM* vm = nullptr;
-    jsize count = 0;
-    fn(&vm, 1, &count);
-    return (count > 0) ? vm : nullptr;
-}
 #endif
 
 using namespace geode::prelude;
@@ -307,157 +290,113 @@ static void mic_thread_func() {
 #endif // !GEODE_IS_ANDROID
 
 #ifdef GEODE_IS_ANDROID
+#include <aaudio/AAudio.h>
+#include <android/log.h>
+#define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "VoiceControl", __VA_ARGS__)
 
-static bool getJNIEnv(JavaVM* vm, JNIEnv** env) {
-    int status = vm->GetEnv((void**)env, JNI_VERSION_1_6);
-    if (status == JNI_EDETACHED) {
-        if (vm->AttachCurrentThread(env, nullptr) != 0) {
-            *env = nullptr;
-            return false;
-        }
-        return true;
+static AAudioStream* g_aaudioStream = nullptr;
+
+static aaudio_data_callback_result_t audioCallback(
+    AAudioStream*, void*, void* audioData, int32_t numFrames
+) {
+    int16_t* buf = (int16_t*)audioData;
+
+    float peak = 0.0f;
+    float sumsq = 0.0f;
+    for (int i = 0; i < numFrames; i++) {
+        float s = buf[i] / 32768.0f;
+        float abss = s < 0.0f ? -s : s;
+        if (abss > peak) peak = abss;
+        sumsq += s * s;
     }
-    return false;
+
+    float rms    = sqrtf(sumsq / (float)numFrames);
+    float peak_db = (peak <= 0.0f) ? -100.0f : 20.0f * log10f(peak);
+    float rms_db  = (rms  <= 0.0f) ? -100.0f : 20.0f * log10f(rms);
+
+    float prev = g_currentPeak.load();
+    float disp = (peak > prev) ? peak : (prev * 0.85f + peak * 0.15f);
+    g_currentPeak.store(disp);
+
+    float thresh         = get_threshold();
+    float release_thresh = thresh - 12.0f;
+    bool  was_above      = g_wasAbove.load();
+    bool  peak_above     = peak_db >= thresh;
+    bool  rms_above      = rms_db  >= release_thresh;
+
+    static int release_counter = 0;
+
+    if (peak_above && !was_above) {
+        g_wasAbove.store(true);
+        release_counter = 0;
+        Loader::get()->queueInMainThread([]() {
+            if (canClick()) {
+                PlayLayer::get()->handleButton(true, (int)PlayerButton::Jump, true);
+            } else {
+                g_wasAbove.store(false);
+            }
+        });
+    } else if (was_above && !peak_above && !rms_above) {
+        release_counter++;
+        if (release_counter >= 1) {
+            g_wasAbove.store(false);
+            release_counter = 0;
+            Loader::get()->queueInMainThread([]() {
+                PlayLayer* pl = PlayLayer::get();
+                if (pl && !pl->m_isPaused && pl->m_player1)
+                    pl->handleButton(false, (int)PlayerButton::Jump, true);
+            });
+        }
+    } else if (peak_above && was_above) {
+        release_counter = 0;
+    }
+
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
 static void mic_thread_func() {
-    JavaVM* vm = getJavaVM();
-    if (!vm) {
-        ANDROID_LOG("mic_thread_func: no JavaVM!");
+    AAudioStreamBuilder* builder = nullptr;
+    if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) {
+        ANDROID_LOG("failed to create stream builder");
+        g_threadReady.store(true);
         return;
     }
 
-    JNIEnv* env = nullptr;
-    bool didAttach = getJNIEnv(vm, &env);
-    if (!env) {
-        ANDROID_LOG("mic_thread_func: failed to get JNIEnv");
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setSampleRate(builder, 44100);
+    AAudioStreamBuilder_setChannelCount(builder, 1);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setInputPreset(builder, AAUDIO_INPUT_PRESET_GENERIC);
+    AAudioStreamBuilder_setDataCallback(builder, audioCallback, nullptr);
+
+    aaudio_result_t result = AAudioStreamBuilder_openStream(builder, &g_aaudioStream);
+    AAudioStreamBuilder_delete(builder);
+
+    if (result != AAUDIO_OK) {
+        ANDROID_LOG("failed to open stream: %s", AAudio_convertResultToText(result));
+        g_threadReady.store(true);
         return;
     }
 
-    const int MIC_SOURCE        = 1;
-    const int CHANNEL_IN_MONO   = 16;
-    const int ENCODING_PCM_16   = 2;
-    const int SAMPLE_RATE       = 44100;
-    const int STATE_INITIALIZED = 1;
-    const int RECORDSTATE_RECORDING = 3;
-
-    jclass arClass = env->FindClass("android/media/AudioRecord");
-    if (!arClass) {
-        ANDROID_LOG("mic_thread_func: AudioRecord class not found");
-        if (didAttach) vm->DetachCurrentThread();
+    result = AAudioStream_requestStart(g_aaudioStream);
+    if (result != AAUDIO_OK) {
+        ANDROID_LOG("failed to start stream: %s", AAudio_convertResultToText(result));
+        AAudioStream_close(g_aaudioStream);
+        g_aaudioStream = nullptr;
+        g_threadReady.store(true);
         return;
     }
-
-    jmethodID getMinBufSizeMethod = env->GetStaticMethodID(arClass, "getMinBufferSize", "(III)I");
-    int minBuf = env->CallStaticIntMethod(arClass, getMinBufSizeMethod,
-        SAMPLE_RATE, CHANNEL_IN_MONO, ENCODING_PCM_16);
-    if (minBuf <= 0) minBuf = 4096;
-
-    int bufferSize = minBuf * 2;
-
-    jmethodID ctorMethod = env->GetMethodID(arClass, "<init>", "(IIIII)V");
-    jobject audioRecord = env->NewObject(arClass, ctorMethod,
-        MIC_SOURCE, SAMPLE_RATE, CHANNEL_IN_MONO, ENCODING_PCM_16, bufferSize);
-    if (!audioRecord) {
-        ANDROID_LOG("mic_thread_func: failed to create AudioRecord");
-        if (didAttach) vm->DetachCurrentThread();
-        return;
-    }
-
-    jmethodID getStateMethod = env->GetMethodID(arClass, "getState", "()I");
-    int state = env->CallIntMethod(audioRecord, getStateMethod);
-    if (state != STATE_INITIALIZED) {
-        ANDROID_LOG("mic_thread_func: AudioRecord not initialized (state=%d)", state);
-        jmethodID releaseMethod = env->GetMethodID(arClass, "release", "()V");
-        env->CallVoidMethod(audioRecord, releaseMethod);
-        if (didAttach) vm->DetachCurrentThread();
-        return;
-    }
-
-    jmethodID startRecordingMethod = env->GetMethodID(arClass, "startRecording", "()V");
-    jmethodID readMethod = env->GetMethodID(arClass, "read", "([SII)I");
-    jmethodID stopMethod = env->GetMethodID(arClass, "stop", "()V");
-    jmethodID releaseMethod = env->GetMethodID(arClass, "release", "()V");
-
-    env->CallVoidMethod(audioRecord, startRecordingMethod);
-    ANDROID_LOG("mic_thread_func: AudioRecord started, bufferSize=%d", bufferSize);
 
     g_threadReady.store(true);
 
-    const int READ_SAMPLES = bufferSize / 2;
-    jshortArray jbuf = env->NewShortArray(READ_SAMPLES);
-
-    int release_counter = 0;
-    const int RELEASE_FRAMES = 1;
-
     while (g_running.load()) {
-        jint read = env->CallIntMethod(audioRecord, readMethod, jbuf, 0, READ_SAMPLES);
-        if (read <= 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-
-        jshort* buf = env->GetShortArrayElements(jbuf, nullptr);
-
-        float peak = 0.0f;
-        float sumsq = 0.0f;
-        for (int i = 0; i < read; i++) {
-            float s = buf[i] / 32768.0f;
-            float abss = s < 0.0f ? -s : s;
-            if (abss > peak) peak = abss;
-            sumsq += s * s;
-        }
-
-        env->ReleaseShortArrayElements(jbuf, buf, JNI_ABORT);
-
-        float rms    = sqrtf(sumsq / (float)read);
-        float peak_db = (peak <= 0.0f) ? -100.0f : 20.0f * log10f(peak);
-        float rms_db  = (rms  <= 0.0f) ? -100.0f : 20.0f * log10f(rms);
-
-        float prev = g_currentPeak.load();
-        float disp = (peak > prev) ? peak : (prev * 0.85f + peak * 0.15f);
-        g_currentPeak.store(disp);
-
-        float thresh         = get_threshold();
-        float release_thresh = thresh - 12.0f;
-        bool  was_above      = g_wasAbove.load();
-        bool  peak_above     = peak_db >= thresh;
-        bool  rms_above      = rms_db  >= release_thresh;
-
-        if (peak_above && !was_above) {
-            g_wasAbove.store(true);
-            release_counter = 0;
-            Loader::get()->queueInMainThread([]() {
-                if (canClick()) {
-                    PlayLayer::get()->handleButton(true, (int)PlayerButton::Jump, true);
-                } else {
-                    g_wasAbove.store(false);
-                }
-            });
-        } else if (was_above && !peak_above && !rms_above) {
-            release_counter++;
-            if (release_counter >= RELEASE_FRAMES) {
-                g_wasAbove.store(false);
-                release_counter = 0;
-                Loader::get()->queueInMainThread([]() {
-                    PlayLayer* pl = PlayLayer::get();
-                    if (pl && !pl->m_isPaused && pl->m_player1)
-                        pl->handleButton(false, (int)PlayerButton::Jump, true);
-                });
-            }
-        } else if (peak_above && was_above) {
-            release_counter = 0;
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    env->DeleteLocalRef(jbuf);
-    env->CallVoidMethod(audioRecord, stopMethod);
-    env->CallVoidMethod(audioRecord, releaseMethod);
-    env->DeleteLocalRef(audioRecord);
-    env->DeleteLocalRef(arClass);
-
-    if (didAttach) vm->DetachCurrentThread();
-    ANDROID_LOG("mic_thread_func: stopped");
+    AAudioStream_requestStop(g_aaudioStream);
+    AAudioStream_close(g_aaudioStream);
+    g_aaudioStream = nullptr;
 }
 
 #endif // GEODE_IS_ANDROID
