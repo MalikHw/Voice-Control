@@ -19,11 +19,11 @@
 #include <android/log.h>
 #define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "VoiceControl", __VA_ARGS__)
 
-static JavaVM* g_javaVM = nullptr;
-
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-    g_javaVM = vm;
-    return JNI_VERSION_1_6;
+static JavaVM* getJavaVM() {
+    JavaVM* vm = nullptr;
+    jsize count = 0;
+    JNI_GetCreatedJavaVMs(&vm, 1, &count);
+    return (count > 0) ? vm : nullptr;
 }
 #endif
 
@@ -311,7 +311,7 @@ static bool getJNIEnv(JavaVM* vm, JNIEnv** env) {
 }
 
 static void mic_thread_func() {
-    JavaVM* vm = g_javaVM;
+    JavaVM* vm = getJavaVM();
     if (!vm) {
         ANDROID_LOG("mic_thread_func: no JavaVM!");
         return;
