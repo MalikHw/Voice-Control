@@ -18,6 +18,13 @@
 #include <jni.h>
 #include <android/log.h>
 #define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "VoiceControl", __VA_ARGS__)
+
+static JavaVM* g_javaVM = nullptr;
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    g_javaVM = vm;
+    return JNI_VERSION_1_6;
+}
 #endif
 
 using namespace geode::prelude;
@@ -304,7 +311,7 @@ static bool getJNIEnv(JavaVM* vm, JNIEnv** env) {
 }
 
 static void mic_thread_func() {
-    JavaVM* vm = geode::hook::getJavaVM();
+    JavaVM* vm = g_javaVM;
     if (!vm) {
         ANDROID_LOG("mic_thread_func: no JavaVM!");
         return;
