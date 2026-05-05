@@ -53,7 +53,6 @@ static float get_threshold() {
     return (float)Mod::get()->getSettingValue<double>("threshold-db");
 }
 
-// ---- Desktop-only mic enumeration (FMOD) ----
 #ifndef GEODE_IS_ANDROID
 
 struct MicInfo {
@@ -132,7 +131,6 @@ static int find_mic_with_audio() {
 
 #endif // !GEODE_IS_ANDROID (MicInfo / is_speaker / list_mics / find_mic_with_audio)
 
-// ---- FMOD mic thread (Desktop/iOS only) ----
 #ifndef GEODE_IS_ANDROID
 static void mic_thread_func() {
     FMOD::System_Create(&g_fmodSystem);
@@ -291,11 +289,8 @@ static void mic_thread_func() {
 
 #endif // !GEODE_IS_ANDROID
 
-// ---- Android JNI mic thread ----
 #ifdef GEODE_IS_ANDROID
 
-// Gets the JNIEnv for the current thread, attaching it if needed.
-// Returns true if we had to attach (caller must detach after).
 static bool getJNIEnv(JavaVM* vm, JNIEnv** env) {
     int status = vm->GetEnv((void**)env, JNI_VERSION_1_6);
     if (status == JNI_EDETACHED) {
@@ -303,13 +298,12 @@ static bool getJNIEnv(JavaVM* vm, JNIEnv** env) {
             *env = nullptr;
             return false;
         }
-        return true; // we attached, caller must detach
+        return true;
     }
-    return false; // already attached
+    return false;
 }
 
 static void mic_thread_func() {
-    // Grab the JavaVM from the JNI entry point Geode exposes
     JavaVM* vm = geode::hook::getJavaVM();
     if (!vm) {
         ANDROID_LOG("mic_thread_func: no JavaVM!");
@@ -323,14 +317,12 @@ static void mic_thread_func() {
         return;
     }
 
-    // --- Set up AudioRecord via JNI ---
-    // AudioRecord constants (from android.media.AudioRecord / AudioFormat)
-    const int MIC_SOURCE        = 1;       // MediaRecorder.AudioSource.MIC
-    const int CHANNEL_IN_MONO   = 16;      // AudioFormat.CHANNEL_IN_MONO
-    const int ENCODING_PCM_16   = 2;       // AudioFormat.ENCODING_PCM_16BIT
+    const int MIC_SOURCE        = 1;
+    const int CHANNEL_IN_MONO   = 16;
+    const int ENCODING_PCM_16   = 2;
     const int SAMPLE_RATE       = 44100;
-    const int STATE_INITIALIZED = 1;       // AudioRecord.STATE_INITIALIZED
-    const int RECORDSTATE_RECORDING = 3;   // AudioRecord.RECORDSTATE_RECORDING
+    const int STATE_INITIALIZED = 1;
+    const int RECORDSTATE_RECORDING = 3;
 
     jclass arClass = env->FindClass("android/media/AudioRecord");
     if (!arClass) {
@@ -339,16 +331,13 @@ static void mic_thread_func() {
         return;
     }
 
-    // int AudioRecord.getMinBufferSize(int, int, int)
     jmethodID getMinBufSizeMethod = env->GetStaticMethodID(arClass, "getMinBufferSize", "(III)I");
     int minBuf = env->CallStaticIntMethod(arClass, getMinBufSizeMethod,
         SAMPLE_RATE, CHANNEL_IN_MONO, ENCODING_PCM_16);
     if (minBuf <= 0) minBuf = 4096;
 
-    // double the buffer for safety
     int bufferSize = minBuf * 2;
 
-    // AudioRecord(int, int, int, int, int)
     jmethodID ctorMethod = env->GetMethodID(arClass, "<init>", "(IIIII)V");
     jobject audioRecord = env->NewObject(arClass, ctorMethod,
         MIC_SOURCE, SAMPLE_RATE, CHANNEL_IN_MONO, ENCODING_PCM_16, bufferSize);
@@ -358,7 +347,6 @@ static void mic_thread_func() {
         return;
     }
 
-    // Check state
     jmethodID getStateMethod = env->GetMethodID(arClass, "getState", "()I");
     int state = env->CallIntMethod(audioRecord, getStateMethod);
     if (state != STATE_INITIALIZED) {
@@ -379,15 +367,13 @@ static void mic_thread_func() {
 
     g_threadReady.store(true);
 
-    // Allocate a short[] buffer for reading
-    const int READ_SAMPLES = bufferSize / 2; // shorts
+    const int READ_SAMPLES = bufferSize / 2;
     jshortArray jbuf = env->NewShortArray(READ_SAMPLES);
 
     int release_counter = 0;
     const int RELEASE_FRAMES = 1;
 
     while (g_running.load()) {
-        // read() blocks until data is available
         jint read = env->CallIntMethod(audioRecord, readMethod, jbuf, 0, READ_SAMPLES);
         if (read <= 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -447,7 +433,6 @@ static void mic_thread_func() {
         }
     }
 
-    // Cleanup
     env->DeleteLocalRef(jbuf);
     env->CallVoidMethod(audioRecord, stopMethod);
     env->CallVoidMethod(audioRecord, releaseMethod);
