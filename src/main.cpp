@@ -17,12 +17,22 @@
 #ifdef GEODE_IS_ANDROID
 #include <jni.h>
 #include <android/log.h>
+#include <dlfcn.h>
 #define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "VoiceControl", __VA_ARGS__)
 
 static JavaVM* getJavaVM() {
+    using GetCreatedJavaVMs_t = jint(*)(JavaVM**, jsize, jsize*);
+
+    void* libart = dlopen("libart.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!libart) libart = dlopen("libdvm.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!libart) return nullptr;
+
+    auto fn = (GetCreatedJavaVMs_t)dlsym(libart, "JNI_GetCreatedJavaVMs");
+    if (!fn) return nullptr;
+
     JavaVM* vm = nullptr;
     jsize count = 0;
-    JNI_GetCreatedJavaVMs(&vm, 1, &count);
+    fn(&vm, 1, &count);
     return (count > 0) ? vm : nullptr;
 }
 #endif
