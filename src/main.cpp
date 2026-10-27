@@ -19,10 +19,9 @@
 
 using namespace geode::prelude;
 
-// hi
 static std::atomic<bool>  g_running(false);
 static std::atomic<bool>  g_threadReady(false);
-static std::atomic<bool>  g_wasAbove(false); // shared so PlayLayer hooks can reset it
+static std::atomic<bool>  g_wasAbove(false);
 static std::atomic<int>   g_selectedDevice(-1);
 static std::atomic<int>   g_activeDevice(0);
 static std::atomic<bool>  g_restartRequested(false);
@@ -34,11 +33,6 @@ static FMOD::Sound*  g_recordSound = nullptr;
 static int           g_recordDevice = 0;
 
 static const int RECORD_LEN = 1024 * 2;
-
-// ok uhm i saw a lot of tiktoks of someone making an external program for this so i made it for geode .-. lol
-// axiom was here
-// mic detection is literally just comparing db levels, if peak is above threshold = jump. thats it
-// https://www.youtube.com/shorts/ZjJJFN9lXuY :O
 
 static bool canClick() {
     PlayLayer* pl = PlayLayer::get();
@@ -54,7 +48,7 @@ struct MicInfo {
     std::string name;
 };
 
-static bool is_speaker(const std::string& name) { // for the ppl who for some reason have 12 speakrers plugged in 
+static bool is_speaker(const std::string& name) {
     std::string lower = name;
     for (char& c : lower) c = tolower(c);
     if (lower.find("speaker") != std::string::npos) return true;
@@ -86,7 +80,6 @@ static std::vector<MicInfo> list_mics() {
 }
 
 static int find_mic_with_audio() {
-    // fmod is stupid so we gotta do this manually
     int numDevices = 0, numConnected = 0;
     g_fmodSystem->getRecordNumDrivers(&numDevices, &numConnected);
 
@@ -120,7 +113,7 @@ static int find_mic_with_audio() {
 
         if (curr > 0) return i;
     }
-    return 0;// fallbackkkkkkkkkkkkkkkkkkk
+    return 0;
 }
 
 static void mic_thread_func() {
@@ -158,9 +151,9 @@ static void mic_thread_func() {
     FMOD_CREATESOUNDEXINFO exparams;
     memset(&exparams, 0, sizeof(FMOD_CREATESOUNDEXINFO));
     exparams.cbsize = sizeof(FMOD_CREATESOUNDEXINFO);
-    exparams.numchannels = 1; // mono only, stereo was overkill
+    exparams.numchannels = 1;
     exparams.format = FMOD_SOUND_FORMAT_PCM16;
-    exparams.defaultfrequency = 44100; // tried 48k, didnt matter
+    exparams.defaultfrequency = 44100;
     exparams.length = RECORD_LEN * sizeof(short);
 
     if (g_fmodSystem->createSound(nullptr, FMOD_CREATESAMPLE | FMOD_2D | FMOD_OPENUSER | FMOD_LOOP_NORMAL, &exparams, &g_recordSound) != FMOD_OK || !g_recordSound) {
@@ -284,7 +277,6 @@ static void mic_thread_func() {
                         g_wasAbove.store(false);
                     }
                 });
-            // still loud, keep holding
             } else if (was_above && !peak_above && !rms_above) {
                 release_counter++;
                 if (release_counter >= RELEASE_FRAMES) {
@@ -302,7 +294,6 @@ static void mic_thread_func() {
         }
 
         pos = curr;
-        // -sleep so were not burning cpu. 2ms seems like a good balance, talking from experience-, nvm going to 1ms
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
@@ -321,8 +312,22 @@ static void mic_thread_func() {
 #endif
 }
 
+static void start_mic();
+
+static void stop_mic() {
+    if (!g_running.exchange(false)) return;
+    if (g_micThread.joinable()) {
+        g_micThread.join();
+    }
+    g_threadReady.store(false);
+    g_currentPeak.store(0.0f);
+    g_wasAbove.store(false);
+    g_activeDevice.store(0);
+}
+
 static void start_mic() {
     if (g_running.load()) return;
+    if (g_micThread.joinable()) g_micThread.join();
     g_running.store(true);
     g_threadReady.store(false);
     g_micThread = std::thread(mic_thread_func);
@@ -346,7 +351,6 @@ static void ask_for_mic() {
 #endif
 }
 
-// reason is people cant fucking set their default mic to wtw they are using and etc
 class MicSelectPopup : public Popup {
 public:
     std::vector<MicInfo> m_mics;
@@ -451,7 +455,6 @@ public:
         }
     }
 
-    // here undefined0 or whoever is reviewing
     void tick(float dt) {
         int active = g_activeDevice.load();
         int sel    = g_selectedDevice.load();
@@ -496,8 +499,18 @@ public:
     }
 };
 
-// simplest ui but we ball
 class $modify(PlayLayer) {
+    bool init(GJGameLevel* level, bool p1, bool p2) {
+        if (!PlayLayer::init(level, p1, p2)) return false;
+        ask_for_mic();
+        return true;
+    }
+
+    void onQuit() {
+        stop_mic();
+        PlayLayer::onQuit();
+    }
+
     void resetLevel() {
         g_wasAbove.store(false);
         PlayLayer::resetLevel();
@@ -531,7 +544,3 @@ class $modify(VCPauseLayer, PauseLayer) {
         if (auto popup = MicSelectPopup::create()) popup->show();
     }
 };
-
-$execute {
-    ask_for_mic();
-}
